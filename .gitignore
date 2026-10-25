@@ -4,3 +4,8 @@ data.*.json
 __pycache__/
 venv/
 .venv/
+vault.json
+vault.tmp
+demo_mall.json
+*.csv
+!sample_passwords.csv

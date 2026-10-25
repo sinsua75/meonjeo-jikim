@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
+import fnmatch
+import hashlib
+import secrets
+import string
 import html
 import json
 import logging
@@ -20,13 +25,16 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+import vault
 
 load_dotenv()
 
@@ -54,6 +62,30 @@ def _int_env(name: str, default: int) -> int:
 
 
 WATCH_INTERVAL_MIN = _int_env("WATCH_INTERVAL_MIN", 60)
+REMIND_INTERVAL_MIN = _int_env("REMIND_INTERVAL_MIN", 60)
+
+ROOT = Path(__file__).resolve().parent
+# 알림의 데모몰 바로가기 주소 (ngrok 등으로 공개했다면 그 주소로)
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL", "").strip() or f"http://127.0.0.1:{PORT}").rstrip("/")
+# 자동 변경 때 서버가 스스로 부르는 데모몰 API
+DEMO_MALL_API = f"http://127.0.0.1:{PORT}/demo-mall"
+DEMO_MALL_NAME = "데모몰"
+DEMO_MALL_FILE = Path(os.getenv("DEMO_MALL_FILE") or ROOT / "demo_mall.json")
+SAMPLE_CSV = ROOT / "sample_passwords.csv"
+DOWNLOADS_DIR = Path(os.getenv("DOWNLOADS_DIR") or Path.home() / "Downloads")
+WATCH_DOWNLOADS = os.getenv("WATCH_DOWNLOADS", "1").strip() != "0"
+DOWNLOADS_PATTERN = "*assword*.csv"
+KST = timezone(timedelta(hours=9))
+
+# 심각도: (이모지, 라벨, ntfy Priority)
+SEVERITY = {
+    "urgent": ("🔴", "긴급", "urgent"),
+    "high": ("🟠", "위험", "high"),
+    "normal": ("🟡", "주의", "default"),
+}
+SENSITIVE_ITEMS = ["비밀번호", "주민등록번호", "유심"]
+# 자동 비번 변경을 지원하는 서비스 (지금은 데모몰만)
+AUTO_CHANGE_SUPPORTED = {DEMO_MALL_NAME}
 
 HIBP_URL = "https://haveibeenpwned.com/api/v3/breaches"
 HIBP_USER_AGENT = "meonjeojikim-mcp/1.0 (personal breach watcher)"
@@ -185,7 +217,7 @@ def _save(data: dict[str, Any]) -> None:
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = DATA_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(DATA_FILE)
+    vault.replace_with_retry(tmp, DATA_FILE)
 
 
 def _new_id(prefix: str) -> str:
@@ -279,6 +311,15 @@ def _j(word: str, pair: str) -> str:
     else:
         has_b = last.lower() in "lmn0136789"
     return word + (with_b if has_b else without_b)
+
+
+def _reuse_warnings(data: dict[str, Any]) -> list[str]:
+    groups: dict[str, list[str]] = {}
+    for s in data["services"]:
+        if s.get("password_group"):
+            groups.setdefault(s["password_group"], []).append(s["name"])
+    return [f"같은 비번을 {len(m)}곳에서 쓰고 있어요 ({g}: {', '.join(m)})"
+            for g, m in groups.items() if len(m) >= 2]
 
 
 def _group_members(data: dict[str, Any], group: str | None, exclude: str | None = None) -> list[str]:
@@ -385,6 +426,7 @@ async def _search_google_news(client: httpx.AsyncClient, query: str) -> tuple[li
                 "description": it.findtext("description") or "",
                 "link": it.findtext("link") or "",
                 "pubDate": it.findtext("pubDate") or "",
+                "press": source,
             })
         return items, None
     except Exception as e:  # noqa: BLE001
@@ -397,21 +439,26 @@ def _rfc2047(value: str) -> str:
     return f"=?UTF-8?B?{base64.b64encode(value.encode('utf-8')).decode('ascii')}?="
 
 
-async def _send_alert(text: str) -> str:
-    """ntfy로 푸시 알림 전송. 본문은 UTF-8 그대로, 한글 제목은 RFC 2047로 인코딩."""
+async def _send_alert(text: str, priority: str = "high", click: str | None = None,
+                      tags: str = "rotating_light") -> str:
+    """ntfy로 푸시 알림 전송. 본문은 UTF-8 그대로, 한글 제목은 RFC 2047로 인코딩.
+    공개 채널이므로 비밀번호 원문은 절대 넣지 않는다."""
     if not NTFY_TOPIC:
         return "skipped (NTFY_TOPIC 미설정)"
+    headers = {
+        "Title": _rfc2047(NTFY_TITLE),
+        "Priority": priority,
+        "Tags": tags,
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    if click:
+        headers["Click"] = click
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{NTFY_SERVER}/{NTFY_TOPIC}",
                 content=text.encode("utf-8"),
-                headers={
-                    "Title": _rfc2047(NTFY_TITLE),
-                    "Priority": "high",
-                    "Tags": "rotating_light",
-                    "Content-Type": "text/plain; charset=utf-8",
-                },
+                headers=headers,
                 timeout=15,
             )
             r.raise_for_status()
@@ -560,11 +607,82 @@ def _sync_actions(data: dict[str, Any], incident: dict[str, Any]) -> list[dict[s
     return created
 
 
-def _alert_text(incident: dict[str, Any], n_actions: int, preventive: list[str]) -> str:
+def _severity(incident: dict[str, Any]) -> tuple[str, list[str]]:
+    """(urgent|high|normal, 판단 이유)."""
+    source = incident.get("source")
+    sensitive = [i for i in SENSITIVE_ITEMS if i in (incident.get("leaked_items") or [])]
+    if source == "simulation":
+        return "urgent", ["데모 시뮬레이션"] + ([f"민감 항목: {', '.join(sensitive)}"] if sensitive else [])
+    reasons: list[str] = []
+    n_articles = n_press = 0
+    if source == "google_news":
+        n_articles = len(incident.get("links") or [])
+        n_press = len(set(incident.get("press") or []))
+        reasons += [f"기사 {n_articles}건", f"언론사 {n_press}곳"]
+    else:
+        reasons.append("Have I Been Pwned 등록 사고")
+    if sensitive:
+        reasons.append(f"민감 항목: {', '.join(sensitive)}")
+    if n_articles >= 10 or sensitive:
+        return "urgent", reasons
+    if n_articles >= 5 or n_press >= 3:
+        return "high", reasons
+    return "normal", reasons
+
+
+def _apply_severity(incident: dict[str, Any]) -> None:
+    incident["severity"], incident["severity_reasons"] = _severity(incident)
+
+
+def _severity_label(level: str) -> str:
+    emoji, label, _ = SEVERITY.get(level, SEVERITY["normal"])
+    return f"{emoji}{label}"
+
+
+def _change_password_url(svc: dict[str, Any] | None) -> str | None:
+    """비번 변경 바로가기 (ntfy Click). 표준 /.well-known/change-password 사용."""
+    if not svc:
+        return None
+    if svc["name"] == DEMO_MALL_NAME:
+        return f"{PUBLIC_BASE_URL}/demo-mall/change-password"
+    domain = svc.get("domain")
+    if not domain:
+        return None
+    host = re.sub(r"^(https?://)?(www\.)?", "", domain.lower()).split("/")[0]
+    return f"https://{host}/.well-known/change-password"
+
+
+def _kst_hhmm() -> str:
+    return datetime.now(KST).strftime("%H:%M")
+
+
+def _alert_text(incident: dict[str, Any], n_actions: int, preventive: list[str],
+                auto: dict[str, Any] | None = None) -> str:
+    """알림 본문. 비밀번호 원문은 절대 넣지 않는다."""
+    name = incident["service"]
+    sev = _severity_label(incident.get("severity", "normal"))
     items = incident.get("leaked_items") or []
-    lines = [
-        f"🚨 {incident['service']} 개인정보 유출 소식이 있어요. {USER_NAME}님 해당돼요. 대응 준비 다 해뒀어요. (할 일 {n_actions}개)",
-    ]
+    if auto and auto.get("changed"):
+        changed, manual = auto["changed"], auto["manual"]
+        if name in changed:
+            head = f"{sev} {name} 유출 감지 → 비번 자동 변경 완료 ({auto['at']}). 새 비번은 금고에서 확인하세요."
+            if manual:
+                head += f" 같은 비번을 쓰던 {_j('·'.join(manual), '은/는')} 직접 바꿔주세요"
+        else:
+            head = (f"{sev} {name} 유출 감지 → 같은 비번을 쓰던 {'·'.join(changed)} 비번 자동 변경 완료 ({auto['at']}). "
+                    f"새 비번은 금고에서 확인하세요. {_j('·'.join(manual), '은/는')} 직접 바꿔주세요")
+        if auto.get("failed"):
+            head += f"\n⚠️ {'·'.join(auto['failed'])} 자동 변경 실패, 직접 바꿔주세요"
+    elif auto and auto.get("failed"):
+        head = f"{sev} {name} 유출 감지 → {'·'.join(auto['failed'])} 자동 변경 실패, 직접 바꿔주세요. (기존 비번 유지)"
+        others = [m for m in auto.get("manual", []) if m not in auto["failed"]]
+        if others:
+            head += f" 같은 비번을 쓰던 {'·'.join(others)}도 직접 바꿔주세요"
+    else:
+        head = f"{sev} {name} 개인정보 유출 소식이 있어요. {USER_NAME}님 해당돼요. 대응 준비 다 해뒀어요. (할 일 {n_actions}개)"
+    lines = [head]
+    if incident.get("severity_reasons"):
+        lines.append(f"판단 근거: {', '.join(incident['severity_reasons'])}")
     lines.append(f"확인된 유출 항목: {', '.join(items) if items else '아직 확인 안 됨'}")
     if preventive:
         lines.append(f"예방 차원 대비: {', '.join(preventive)} (맡긴 정보)")
@@ -572,9 +690,339 @@ def _alert_text(incident: dict[str, Any], n_actions: int, preventive: list[str])
         lines.append(f"내용: {incident['title']}")
     if incident.get("links"):
         lines.append(f"출처: {incident['links'][0]}")
+    if auto and auto.get("changed"):
+        lines.append(f"남은 할 일 {n_actions}개")
     lines.append(f"먼저 할 일: 털린 내 정보 찾기 조회 {LINK_KIDC}")
     lines.append(f"사고 ID: {incident['id']}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 데모몰 (테스트용 가짜 쇼핑몰) - 비번은 해시로만 저장
+# ---------------------------------------------------------------------------
+
+
+def _hash_pw(password: str, salt: bytes | None = None) -> tuple[str, str]:
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return salt.hex(), digest.hex()
+
+
+def _sample_demo_account() -> tuple[str, str]:
+    """sample_passwords.csv의 데모몰 계정 (초기 비번을 같게 맞춘다)."""
+    try:
+        with SAMPLE_CSV.open(encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                host = urlparse(row.get("url") or "").hostname or ""
+                if host in ("localhost", "127.0.0.1") or (row.get("name") or "").strip() == DEMO_MALL_NAME:
+                    return row["username"], row["password"]
+    except OSError:
+        pass
+    return "sua@demo.test", secrets.token_urlsafe(12)
+
+
+def _demo_load() -> dict[str, Any]:
+    if DEMO_MALL_FILE.exists():
+        return json.loads(DEMO_MALL_FILE.read_text(encoding="utf-8"))
+    username, password = _sample_demo_account()
+    salt, digest = _hash_pw(password)
+    acct = {"username": username, "salt": salt, "hash": digest,
+            "changed_at": _iso(), "changed_by": "초기 설정 (sample_passwords.csv)"}
+    DEMO_MALL_FILE.write_text(json.dumps(acct, ensure_ascii=False, indent=2), encoding="utf-8")
+    return acct
+
+
+def _demo_verify(username: str, password: str) -> bool:
+    acct = _demo_load()
+    if (username or "").strip().lower() != acct["username"].lower():
+        return False
+    _, digest = _hash_pw(password or "", bytes.fromhex(acct["salt"]))
+    return secrets.compare_digest(digest.encode(), acct["hash"].encode())
+
+
+def _demo_set_password(new_password: str, by: str) -> str:
+    acct = _demo_load()
+    acct["salt"], acct["hash"] = _hash_pw(new_password)
+    acct["changed_at"] = _iso()
+    acct["changed_by"] = by
+    DEMO_MALL_FILE.write_text(json.dumps(acct, ensure_ascii=False, indent=2), encoding="utf-8")
+    return acct["changed_at"]
+
+
+# ---------------------------------------------------------------------------
+# 자동 비번 변경 (데모)
+# ---------------------------------------------------------------------------
+
+
+def _strong_password(length: int = 20) -> str:
+    symbols = "!@#$%^&*-_=+?"
+    pools = [string.ascii_lowercase, string.ascii_uppercase, string.digits, symbols]
+    alphabet = "".join(pools)
+    while True:
+        pw = "".join(secrets.choice(alphabet) for _ in range(length))
+        if all(any(c in pool for c in pw) for pool in pools):
+            return pw
+
+
+async def _change_via_adapter(service: str, username: str, old: str, new: str) -> tuple[bool, str]:
+    """서비스별 비번 변경 어댑터. 지금은 데모몰만 지원. 오류 메시지에 비번을 넣지 않는다."""
+    if service != DEMO_MALL_NAME:
+        return False, "자동 변경 미지원 서비스"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(f"{DEMO_MALL_API}/change-password",
+                                  json={"username": username, "current_password": old, "new_password": new},
+                                  headers={"X-Meonjeo-Auto": "1"}, timeout=15)
+        if r.status_code == 200 and r.json().get("ok"):
+            return True, ""
+        return False, f"데모몰 응답 {r.status_code}"
+    except Exception as e:  # noqa: BLE001
+        return False, f"데모몰 연결 실패 ({type(e).__name__})"
+
+
+def _next_group_label(used: set[str]) -> str:
+    for i in range(26 * 4):
+        letter = chr(ord("A") + i % 26) + ("" if i < 26 else str(i // 26))
+        label = f"{letter}그룹"
+        if label not in used:
+            return label
+    return f"{uuid.uuid4().hex[:4]}그룹"
+
+
+async def _auto_change(incident: dict[str, Any]) -> dict[str, Any] | None:
+    """urgent 사고에서 해당 서비스/같은 그룹 중 금고에 있고 자동 변경을 지원하는 곳의 비번을 바꾼다."""
+    async with _store_lock:
+        data = _load()
+    svc = next((s for s in data["services"] if s["name"] == incident["service"]), None)
+    group = (svc or {}).get("password_group")
+    members = [incident["service"]] + _group_members(data, group, exclude=incident["service"])
+    targets = [m for m in members if m in AUTO_CHANGE_SUPPORTED and vault.has(m)]
+    if not targets:
+        return None
+    changed, failed, errors = [], [], {}
+    for t in targets:
+        meta = vault.entry(t) or {}
+        old = vault.get_password(t) or ""
+        new = _strong_password(20)
+        ok, err = await _change_via_adapter(t, meta.get("username", ""), old, new)
+        if ok:
+            vault.put(t, new, username=meta.get("username", ""), url=meta.get("url", ""), source="auto_change")
+            changed.append(t)
+            log.info("자동 비번 변경 완료: %s", t)
+        else:
+            failed.append(t)
+            errors[t] = err
+            log.warning("자동 비번 변경 실패: %s (%s) - 기존 비번 유지", t, err)
+        del old, new
+    return {"changed": changed, "failed": failed, "errors": errors,
+            "manual": [m for m in members if m not in changed], "at": _kst_hhmm()}
+
+
+def _apply_auto_result(data: dict[str, Any], incident: dict[str, Any], auto: dict[str, Any]) -> None:
+    """자동 변경 결과를 할 일/그룹에 반영 (비번 원문 없음)."""
+    for t in auto["changed"]:
+        for a in data["actions"]:
+            if a["incident_id"] != incident["id"] or a["done"]:
+                continue
+            if a["title"] == f"{t} 비밀번호 변경" or a["title"].startswith(f"{t} 비밀번호도 변경"):
+                a["done"] = True
+                a["completed_at"] = _iso()
+                a["detail"] += f" ✅ 먼저지킴이 자동 변경 완료 ({auto['at']}). 새 비번은 내 PC에서 show_password.py로 확인하세요."
+        # 이제 다른 비번이므로 혼자 쓰는 새 꼬리표로
+        svc = next((s for s in data["services"] if s["name"] == t), None)
+        if svc:
+            used = {s.get("password_group") for s in data["services"] if s.get("password_group")}
+            svc["password_group"] = _next_group_label(used)
+    incident["auto_change"] = dict(auto)
+
+
+async def _process_new_incident(incident_id: str, preventive: list[str]) -> dict[str, Any]:
+    """새 사고 공통 처리: (urgent면) 자동 변경 → 알림 → 결과. 비밀번호 원문은 어디에도 싣지 않는다."""
+    async with _store_lock:
+        incident = next(i for i in _load()["incidents"] if i["id"] == incident_id)
+    auto = None
+    if incident.get("severity") == "urgent":
+        try:
+            auto = await _auto_change(incident)
+        except Exception as e:  # noqa: BLE001
+            log.warning("자동 변경 처리 오류: %s", type(e).__name__)
+    async with _store_lock:
+        data = _load()
+        incident = next(i for i in data["incidents"] if i["id"] == incident_id)
+        if auto:
+            _apply_auto_result(data, incident, auto)
+        pending = [a for a in data["actions"] if a["incident_id"] == incident_id and not a["done"]]
+        svc = next((s for s in data["services"] if s["name"] == incident["service"]), None)
+        level = incident.get("severity", "normal")
+        status = await _send_alert(_alert_text(incident, len(pending), preventive, auto),
+                                   priority=SEVERITY[level][2], click=_change_password_url(svc))
+        incident["last_alert_at"] = _iso()
+        _save(data)
+    return {
+        "incident_id": incident["id"], "service": incident["service"], "source": incident["source"],
+        "title": incident["title"], "severity": level, "severity_label": _severity_label(level),
+        "severity_reasons": incident.get("severity_reasons", []),
+        "confirmed_items": incident["leaked_items"], "preventive_items": preventive,
+        "links": incident["links"][:3], "actions_created": len(incident.get("action_ids", [])),
+        "pending_actions": len(pending),
+        "auto_change": incident.get("auto_change"),
+        "notify": status,
+    }
+
+
+async def _send_reminders() -> int:
+    """urgent 사고에 미완료 할 일이 있으면 REMIND_INTERVAL_MIN마다 다시 알린다."""
+    sent = 0
+    async with _store_lock:
+        data = _load()
+        for inc in data["incidents"]:
+            if inc.get("severity") != "urgent" or inc.get("resolved"):
+                continue
+            pending = [a for a in data["actions"] if a["incident_id"] == inc["id"] and not a["done"]]
+            if not pending:
+                continue
+            last = inc.get("last_alert_at")
+            if last and _now() - datetime.fromisoformat(last) < timedelta(minutes=REMIND_INTERVAL_MIN):
+                continue
+            svc = next((s for s in data["services"] if s["name"] == inc["service"]), None)
+            text = (f"{_severity_label('urgent')} 다시 알려요: {inc['service']} 유출 대응 할 일 {len(pending)}개가 남았어요.\n"
+                    + "\n".join(f"- {a['title']}" for a in pending[:5])
+                    + f"\n사고 ID: {inc['id']}")
+            await _send_alert(text, priority="urgent", click=_change_password_url(svc))
+            inc["last_alert_at"] = _iso()
+            sent += 1
+        if sent:
+            _save(data)
+    return sent
+
+
+# ---------------------------------------------------------------------------
+# 크롬 비번 CSV 가져오기 (비번은 금고로만, 요약만 출력)
+# ---------------------------------------------------------------------------
+
+DOMAIN_SERVICE_MAP: list[tuple[list[str], str, str]] = [
+    (["coupang"], "쿠팡", "쇼핑"),
+    (["baemin"], "배민", "배달"),
+    (["tworld", "sktelecom"], "SKT", "통신사"),
+    (["11st"], "11번가", "쇼핑"),
+    (["netflix"], "넷플릭스", "기타"),
+    (["localhost", "127.0.0.1"], DEMO_MALL_NAME, "쇼핑"),
+]
+_SECOND_LEVEL = {"co", "or", "go", "ne", "ac", "com", "net"}
+
+
+def _service_from_url(url: str, fallback: str) -> tuple[str, str, str | None]:
+    host = (urlparse(url if "://" in (url or "") else f"https://{url}").hostname or "").lower()
+    if host in ("localhost", "127.0.0.1"):
+        return DEMO_MALL_NAME, "쇼핑", "localhost"
+    labels = re.sub(r"^www\.", "", host).split(".")
+    if len(labels) >= 3 and labels[-2] in _SECOND_LEVEL:
+        domain = ".".join(labels[-3:])
+    else:
+        domain = ".".join(labels[-2:]) if host else None
+    for keys, name, category in DOMAIN_SERVICE_MAP:
+        if any(k in host for k in keys):
+            return name, category, domain
+    return (domain or fallback or "알 수 없음"), "기타", domain
+
+
+def import_password_csv(path: str | Path) -> dict[str, Any]:
+    """크롬 CSV(name,url,username,password,note) → 서비스 등록 + 금고 저장 + 같은 비번 그룹 지정.
+    반환값/로그에 비밀번호 원문은 없다. (서버 안에서는 호출 측이 _store_lock을 잡는다)"""
+    rows: dict[str, dict[str, Any]] = {}
+    with Path(path).open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if not row.get("password"):
+                continue
+            name, category, domain = _service_from_url(row.get("url") or "", row.get("name") or "")
+            rows[name] = {"category": category, "domain": domain, "row": row}
+    for name, r in rows.items():
+        row = r.pop("row")
+        vault.put(name, row["password"], username=row.get("username") or "", url=row.get("url") or "",
+                  source="import")
+
+    data = _load()
+    by_key = {_norm(s["name"]): s for s in data["services"]}
+    for name, r in rows.items():
+        svc = by_key.get(_norm(name))
+        if svc:
+            svc["domain"] = r["domain"] or svc.get("domain")
+            svc["updated_at"] = _iso()
+        else:
+            svc = {"id": _new_id("svc"), "name": name, "category": r["category"], "password_group": None,
+                   "stored_info": CATEGORY_STORED_INFO[r["category"]], "domain": r["domain"],
+                   "registered_at": _iso()}
+            data["services"].append(svc)
+            by_key[_norm(name)] = svc
+
+    # 같은 비번(지문)끼리 묶어서 꼬리표 지정 - 금고 전체 기준
+    clusters: dict[str, list[str]] = {}
+    for service, fp in vault.fingerprints().items():
+        clusters.setdefault(fp, []).append(service)
+    vault_names = {_norm(n) for members in clusters.values() for n in members}
+    used = {s["password_group"] for s in data["services"]
+            if s.get("password_group") and _norm(s["name"]) not in vault_names}
+    shared = []
+    for members in sorted(clusters.values(), key=lambda m: (-len(m), m)):
+        label = _next_group_label(used)
+        used.add(label)
+        for m in members:
+            if _norm(m) in by_key:
+                by_key[_norm(m)]["password_group"] = label
+        if len(members) >= 2:
+            shared.append({"group": label, "services": members})
+    _save(data)
+
+    shared_count = sum(len(g["services"]) for g in shared)
+    detail = "; ".join(f"{g['group']}: {', '.join(g['services'])}" for g in shared)
+    message = f"서비스 {len(rows)}개 등록, 같은 비번 그룹 {len(shared)}개" + (f" ({detail})" if detail else "")
+    return {"services": len(rows), "service_names": list(rows), "shared_groups": shared,
+            "shared_service_count": shared_count, "message": message}
+
+
+async def _downloads_watch() -> None:
+    """다운로드 폴더에 새 '*assword*.csv'가 생기면 자동으로 가져오고 원본을 지운다.
+    서버 시작 전부터 있던 파일은 건드리지 않는다."""
+    if not DOWNLOADS_DIR.exists():
+        log.info("다운로드 폴더 없음 → 감시 안 함: %s", DOWNLOADS_DIR)
+        return
+    seen = {p.name for p in DOWNLOADS_DIR.iterdir()}
+    retries: dict[str, int] = {}
+    log.info("다운로드 폴더 감시 시작: %s (%s)", DOWNLOADS_DIR, DOWNLOADS_PATTERN)
+    while True:
+        await asyncio.sleep(3)
+        try:
+            for p in list(DOWNLOADS_DIR.iterdir()):
+                if p.name in seen or not fnmatch.fnmatch(p.name.lower(), DOWNLOADS_PATTERN):
+                    continue
+                size = p.stat().st_size
+                await asyncio.sleep(1)
+                if not p.exists() or p.stat().st_size != size:
+                    continue  # 아직 쓰는 중
+                try:
+                    async with _store_lock:
+                        summary = await asyncio.to_thread(import_password_csv, p)
+                    for _ in range(10):  # 백신 검사 등으로 잠깐 잠겨 있을 수 있음
+                        try:
+                            p.unlink()
+                            break
+                        except PermissionError:
+                            await asyncio.sleep(1)
+                    retries.pop(p.name, None)
+                    log.info("자동 가져오기 완료, 원본 삭제: %s (%s)", p.name, summary["message"])
+                    await _send_alert(
+                        f"📥 서비스 {summary['services']}개 가져왔어요. 같은 비번 {summary['shared_service_count']}곳 발견\n"
+                        + summary["message"], priority="default", tags="inbox_tray")
+                except PermissionError as e:  # 파일이 잠겨 있음 → 다음 주기에 다시
+                    retries[p.name] = retries.get(p.name, 0) + 1
+                    log.warning("자동 가져오기 대기(잠김 %d회): %s (%s)", retries[p.name], p.name, e)
+                    if retries[p.name] >= 10:
+                        seen.add(p.name)
+                except Exception as e:  # noqa: BLE001
+                    seen.add(p.name)  # 같은 파일로 무한 재시도 방지
+                    log.warning("자동 가져오기 실패: %s (%s: %s)", p.name, type(e).__name__, e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("다운로드 감시 오류: %s", type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +1069,8 @@ async def _run_check(days: int) -> dict[str, Any]:
                             continue
                         link = it["link"]
                         if link:
-                            articles[link] = {"title": title, "desc": desc, "link": link, "pub": pub}
+                            articles[link] = {"title": title, "desc": desc, "link": link, "pub": pub,
+                                              "press": it.get("press", "")}
                 if articles:
                     arts = sorted(articles.values(), key=lambda a: a["pub"], reverse=True)
                     leaked: list[str] = []
@@ -632,6 +1081,7 @@ async def _run_check(days: int) -> dict[str, Any]:
                     candidates.append({
                         "service": svc["name"], "source": "google_news", "key": None,
                         "title": arts[0]["title"], "links": [a["link"] for a in arts],
+                        "press": sorted({a["press"] for a in arts if a["press"]}),
                         "leaked_items": leaked, "published_at": _iso(arts[0]["pub"]),
                     })
 
@@ -691,6 +1141,8 @@ async def _run_check(days: int) -> dict[str, Any]:
                                      and datetime.fromisoformat(i["detected_at"]) >= since), None)
                     if existing:
                         existing["links"].extend(fresh)
+                        existing["press"] = sorted(set(existing.get("press", [])) | set(c.get("press", [])))
+                        _apply_severity(existing)
                         new_items = [i for i in c["leaked_items"] if i not in existing["leaked_items"]]
                         if new_items:  # 새로 확인된 항목 → 예방 조치를 확인 조치로 올림
                             existing["leaked_items"].extend(new_items)
@@ -707,10 +1159,12 @@ async def _run_check(days: int) -> dict[str, Any]:
                     "leaked_items": c["leaked_items"],
                     "items_confirmed": bool(c["leaked_items"]),
                     "data_classes": c.get("data_classes", []),
+                    "press": c.get("press", []),
                     "published_at": c["published_at"],
                     "detected_at": _iso(),
                     "resolved": False,
                 }
+                _apply_severity(incident)
                 data["incidents"].append(incident)
                 _sync_actions(data, incident)
                 svc = next((s for s in data["services"] if s["name"] == incident["service"]), None)
@@ -724,14 +1178,7 @@ async def _run_check(days: int) -> dict[str, Any]:
         # --- 알림 ---
         results = []
         for inc in new_incidents:
-            preventive = preventive_by_id[inc["id"]]
-            status = await _send_alert(_alert_text(inc, len(inc["action_ids"]), preventive))
-            results.append({
-                "incident_id": inc["id"], "service": inc["service"], "source": inc["source"],
-                "title": inc["title"], "confirmed_items": inc["leaked_items"], "preventive_items": preventive,
-                "links": inc["links"][:3],
-                "actions_created": len(inc["action_ids"]), "notify": status,
-            })
+            results.append(await _process_new_incident(inc["id"], preventive_by_id[inc["id"]]))
 
         return {
             "checked_services": len(services),
@@ -752,6 +1199,9 @@ async def _watch_loop() -> None:
         try:
             result = await _run_check(days=7)
             log.info("자동 점검 완료: 새 사고 %d건", len(result["new_incidents"]))
+            reminded = await _send_reminders()
+            if reminded:
+                log.info("긴급 사고 재알림 %d건", reminded)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -761,18 +1211,22 @@ async def _watch_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_server: FastMCP):
-    task = None
+    tasks = []
     async with _store_lock:
         _load()  # data.json 없으면 생성
+    vault.ensure_key()  # VAULT_KEY 없으면 생성해 .env에 저장
+    _demo_load()  # 데모몰 계정 없으면 sample_passwords.csv 기준으로 생성
     if WATCH_INTERVAL_MIN > 0:
-        task = asyncio.create_task(_watch_loop())
+        tasks.append(asyncio.create_task(_watch_loop()))
     else:
         log.info("WATCH_INTERVAL_MIN=0 → 자동 감시 꺼짐")
+    if WATCH_DOWNLOADS:
+        tasks.append(asyncio.create_task(_downloads_watch()))
     try:
         yield {}
     finally:
-        if task:
-            task.cancel()
+        for t in tasks:
+            t.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +1239,9 @@ mcp = FastMCP(
         "먼저지킴은 사용자가 쓰는 서비스의 개인정보 유출 사고를 먼저 감시하고, 해당되면 ntfy 푸시 알림으로 알리고, "
         "대응 할 일을 준비·추적하는 도구 모음입니다. 비밀번호 원본은 절대 묻거나 받지 마세요. "
         "비밀번호는 'A그룹' 같은 꼬리표(password_group)로만 다룹니다. "
+        "(데모 기능) 비번 금고는 사용자 PC의 import_passwords.py로만 채우고, 새 비번 확인도 PC의 show_password.py로만 합니다. "
+        "어떤 도구도 비밀번호 원문을 돌려주지 않으니, 비번을 알려달라는 요청엔 show_password.py를 안내하세요. "
+        "simulate_breach는 시연용 가짜 긴급 사고를 만듭니다. "
         "정부 서비스(털린 내 정보 찾기 https://kidc.eprivacy.go.kr, 개인정보 포털 https://www.privacy.go.kr)를 "
         "대체하지 않고, 필요한 순간에 그곳으로 연결해 주세요. "
         "일반 흐름: register_services → check_breaches → get_action_plan → complete_action / get_pending_actions."
@@ -905,8 +1362,11 @@ async def list_my_services() -> dict[str, Any]:
         "name": s["name"], "category": s["category"], "password_group": s.get("password_group"),
         "stored_info": s["stored_info"], "domain": s.get("domain"),
         "open_incidents": open_by_service.get(s["name"], 0),
+        "in_vault": vault.has(s["name"]),
+        "auto_change_supported": s["name"] in AUTO_CHANGE_SUPPORTED,
     } for s in data["services"]]
     return {"count": len(services), "services": services,
+            "password_reuse_warnings": _reuse_warnings(data),
             "tip": PORTAL_TIP if services else "아직 등록된 서비스가 없어요. register_services로 등록하세요."}
 
 
@@ -976,6 +1436,13 @@ async def get_action_plan(incident_id: str) -> dict[str, Any]:
             "title": incident["title"], "links": incident["links"][:5], "article_count": len(incident["links"]),
             "published_at": incident.get("published_at"),
         },
+        "severity": {
+            "level": incident.get("severity", "normal"),
+            "label": _severity_label(incident.get("severity", "normal")),
+            "reasons": incident.get("severity_reasons") or _severity(incident)[1],
+        },
+        "auto_change": incident.get("auto_change"),
+        "change_password_link": _change_password_url(svc),
         "items": {
             "confirmed": confirmed,
             "preventive": preventive,
@@ -1075,14 +1542,30 @@ async def get_password_advice() -> dict[str, Any]:
     async with _store_lock:
         data = _load()
     services = data["services"]
-    breached = {i["service"] for i in data["incidents"] if not i.get("resolved")}
+    open_incidents = [i for i in data["incidents"] if not i.get("resolved")]
+    auto_changed = {n for i in open_incidents for n in (i.get("auto_change") or {}).get("changed", [])}
+    breached = {i["service"] for i in open_incidents} - auto_changed
     groups: dict[str, list[str]] = {}
     for s in services:
         if s.get("password_group"):
             groups.setdefault(s["password_group"], []).append(s["name"])
 
     urgent, recommended = [], []
+    covered: set[str] = set()
+    for inc in open_incidents:  # 자동 변경 후 남은 같은 비번 서비스
+        auto = inc.get("auto_change") or {}
+        manual = [m for m in auto.get("manual", []) if m not in auto_changed and m != inc["service"]]
+        if auto.get("changed") and manual:
+            covered.update(manual)
+            urgent.append({
+                "password_group": next((s.get("password_group") for s in services if s["name"] == manual[0]), None),
+                "services": manual,
+                "reason": f"{inc['service']} 유출 사고 때 같은 비번을 쓰던 곳이에요. {_j('·'.join(auto['changed']), '은/는')} "
+                          f"자동으로 바꿨지만, 같은 비번을 {len(manual)}곳에서 아직 쓰고 있어요. 직접 바꿔주세요.",
+            })
     for group, members in groups.items():
+        if set(members) <= covered:
+            continue
         hit = [m for m in members if m in breached]
         if hit:
             urgent.append({
@@ -1093,7 +1576,7 @@ async def get_password_advice() -> dict[str, Any]:
         elif len(members) >= 2:
             recommended.append({
                 "password_group": group, "services": members,
-                "reason": f"{len(members)}곳이 같은 꼬리표({group})를 써요. 한 곳만 털려도 나머지가 연쇄로 위험해요. "
+                "reason": f"같은 비번을 {len(members)}곳에서 쓰고 있어요 ({group}). 한 곳만 털려도 나머지가 연쇄로 위험해요. "
                           "여유 있을 때 중요한 곳(통신사·카드·쇼핑)부터 따로 바꾸세요.",
             })
     no_group_breached = [n for n in breached
@@ -1109,8 +1592,156 @@ async def get_password_advice() -> dict[str, Any]:
         "message": ("지금 꼭 바꿔야 할 곳은 없어요. 주기적으로 바꿀 필요는 없고, 사고가 나면 먼저 알려드릴게요."
                     if not urgent and not recommended else
                     "진짜 바꿔야 할 곳만 골랐어요. 정기 변경은 필요 없어요."),
+        "password_reuse_warnings": _reuse_warnings(data),
         "tip": f"내 계정이 유출 DB에 있는지는 털린 내 정보 찾기에서 확인할 수 있어요 ({LINK_KIDC})",
     }
+
+
+@mcp.tool(
+    description=(
+        "[시연용] 뉴스 없이 가짜 '긴급(urgent)' 유출 사고를 만들어 전체 대응 흐름을 바로 실행합니다. "
+        "사용자가 '데모 보여줘', '데모몰 유출 시뮬레이션 해줘', '자동 비번 변경 시연'처럼 요청할 때만 사용하세요. "
+        "흐름: 사고 생성(유출 항목: 비밀번호·이메일·전화번호) → 대응 할 일 생성 → 해당 서비스나 같은 비번 그룹 중 "
+        "금고에 있고 자동 변경을 지원하는 곳(지금은 데모몰)의 비번을 20자 랜덤 비번으로 실제 변경 → ntfy 긴급 알림. "
+        "새 비번은 응답에 절대 포함되지 않습니다. 확인은 사용자 PC에서 'python show_password.py 데모몰'로 안내하세요. "
+        "service는 등록된 서비스 이름이어야 합니다 (예: 데모몰)."
+    ),
+)
+async def simulate_breach(service: str) -> dict[str, Any]:
+    try:
+        async with _store_lock:
+            data = _load()
+            svc = next((s for s in data["services"] if _norm(s["name"]) == _norm(service)), None)
+            if not svc:
+                return {"ok": False, "message": f"'{service}'는 등록된 서비스가 아니에요. 등록된 서비스: "
+                                                + ", ".join(s["name"] for s in data["services"])}
+            incident = {
+                "id": _new_id("inc"),
+                "service": svc["name"],
+                "source": "simulation",
+                "title": f"[데모] {svc['name']} 개인정보 유출 (시뮬레이션)",
+                "links": [],
+                "leaked_items": ["비밀번호", "이메일", "전화번호"],
+                "items_confirmed": True,
+                "data_classes": [],
+                "press": [],
+                "published_at": _iso(),
+                "detected_at": _iso(),
+                "resolved": False,
+            }
+            _apply_severity(incident)
+            data["incidents"].append(incident)
+            _sync_actions(data, incident)
+            preventive = _item_basis(incident, svc)[1]
+            _save(data)
+        result = await _process_new_incident(incident["id"], preventive)
+        result["ok"] = True
+        result["next_step"] = ("get_action_plan으로 남은 할 일을 보여주세요. 새 비번은 사용자 PC에서 "
+                               "'python show_password.py " + svc["name"] + "'로만 확인할 수 있어요.")
+        return result
+    except Exception as e:  # noqa: BLE001
+        log.exception("simulate_breach 오류")
+        return {"ok": False, "message": f"시뮬레이션 중 오류: {type(e).__name__}"}
+
+
+# ---------------------------------------------------------------------------
+# 데모몰 웹 화면 / API (테스트용 가짜 쇼핑몰)
+# ---------------------------------------------------------------------------
+
+_DEMO_CSS = """
+:root{--bg:#f6f7fb;--card:#fff;--ink:#1d2433;--muted:#667085;--brand:#ff5a36;--ok:#12b76a;--bad:#f04438}
+@media (prefers-color-scheme: dark){:root{--bg:#12141a;--card:#1c1f27;--ink:#eef0f5;--muted:#98a2b3}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,'Malgun Gothic',sans-serif}
+main{max-width:520px;margin:40px auto;padding:0 16px}.card{background:var(--card);border-radius:16px;padding:24px;box-shadow:0 2px 12px #0001;margin-bottom:16px}
+h1{margin:0 0 4px;font-size:22px}h1 span{color:var(--brand)}.muted{color:var(--muted);font-size:14px}
+.big{font-size:28px;font-weight:700;margin:8px 0}label{display:block;font-size:14px;margin:12px 0 4px}
+input{width:100%;padding:10px;border-radius:10px;border:1px solid #8884;background:transparent;color:inherit;font-size:15px}
+button{margin-top:16px;width:100%;padding:12px;border:0;border-radius:10px;background:var(--brand);color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+nav a{color:var(--brand);margin-right:12px;text-decoration:none;font-size:14px}#msg{margin-top:12px;font-weight:600}
+"""
+
+
+def _demo_page(title: str, body: str, refresh: bool = False) -> HTMLResponse:
+    meta = '<meta http-equiv="refresh" content="5">' if refresh else ""
+    return HTMLResponse(
+        f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">{meta}<title>{html.escape(title)}</title>
+<style>{_DEMO_CSS}</style></head><body><main>
+<div class="card"><h1>🛍️ <span>데모몰</span></h1><div class="muted">먼저지킴 시연용 가짜 쇼핑몰 (진짜 쇼핑몰 아님)</div>
+<nav style="margin-top:12px"><a href="/demo-mall">내 계정</a><a href="/demo-mall/login">로그인</a>
+<a href="/demo-mall/change-password">비밀번호 변경</a></nav></div>{body}</main></body></html>""")
+
+
+_DEMO_FORM_JS = """
+<script>
+async function send(e, url, fields){
+  e.preventDefault(); const f=e.target, body={};
+  fields.forEach(k=>body[k]=f.elements[k].value);
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json(); const m=document.getElementById('msg');
+  m.textContent=j.message; m.style.color=j.ok?'var(--ok)':'var(--bad)'; if(j.ok) f.reset();
+}
+</script>"""
+
+
+@mcp.custom_route("/demo-mall", methods=["GET"])
+async def demo_mall_home(_request: Request) -> HTMLResponse:
+    acct = _demo_load()
+    changed = datetime.fromisoformat(acct["changed_at"]).astimezone(KST)
+    mins = int((_now() - datetime.fromisoformat(acct["changed_at"])).total_seconds() // 60)
+    ago = "방금 전" if mins < 1 else f"{mins}분 전" if mins < 60 else f"{mins // 60}시간 전"
+    body = f"""<div class="card"><div class="muted">계정</div><div>{html.escape(acct['username'])}</div>
+<div class="muted" style="margin-top:16px">마지막 비밀번호 변경</div>
+<div class="big">{changed:%Y-%m-%d %H:%M}</div><div class="muted">{ago} · {html.escape(acct['changed_by'])}</div>
+<div class="muted" style="margin-top:16px">비밀번호는 화면에 표시하지 않아요. 이 페이지는 5초마다 새로고침돼요.</div></div>"""
+    return _demo_page("데모몰 - 내 계정", body, refresh=True)
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+@mcp.custom_route("/demo-mall/login", methods=["GET", "POST"])
+async def demo_mall_login(request: Request):
+    if request.method == "GET":
+        return _demo_page("데모몰 - 로그인", """<div class="card"><h2>로그인</h2>
+<form onsubmit="send(event,'/demo-mall/login',['username','password'])">
+<label>이메일</label><input name="username" autocomplete="username">
+<label>비밀번호</label><input name="password" type="password" autocomplete="current-password">
+<button>로그인</button><div id="msg"></div></form></div>""" + _DEMO_FORM_JS)
+    b = await _json_body(request)
+    if _demo_verify(b.get("username", ""), b.get("password", "")):
+        return JSONResponse({"ok": True, "message": "로그인 성공! 환영해요."})
+    return JSONResponse({"ok": False, "message": "이메일 또는 비밀번호가 틀렸어요."}, status_code=401)
+
+
+@mcp.custom_route("/demo-mall/change-password", methods=["GET", "POST"])
+async def demo_mall_change_password(request: Request):
+    if request.method == "GET":
+        return _demo_page("데모몰 - 비밀번호 변경", """<div class="card"><h2>비밀번호 변경</h2>
+<form onsubmit="send(event,'/demo-mall/change-password',['username','current_password','new_password'])">
+<label>이메일</label><input name="username" autocomplete="username">
+<label>현재 비밀번호</label><input name="current_password" type="password" autocomplete="current-password">
+<label>새 비밀번호 (12자 이상)</label><input name="new_password" type="password" autocomplete="new-password">
+<button>변경하기</button><div id="msg"></div></form></div>""" + _DEMO_FORM_JS)
+    b = await _json_body(request)
+    if not _demo_verify(b.get("username", ""), b.get("current_password", "")):
+        return JSONResponse({"ok": False, "message": "현재 비밀번호가 틀렸어요."}, status_code=401)
+    new = b.get("new_password") or ""
+    if len(new) < 12:
+        return JSONResponse({"ok": False, "message": "새 비밀번호는 12자 이상이어야 해요."}, status_code=400)
+    by = "먼저지킴 자동 변경" if request.headers.get("x-meonjeo-auto") == "1" else "직접 변경"
+    _demo_set_password(new, by)
+    return JSONResponse({"ok": True, "message": "비밀번호를 바꿨어요."})
+
+
+@mcp.custom_route("/.well-known/change-password", methods=["GET"])
+async def well_known_change_password(_request: Request) -> RedirectResponse:
+    return RedirectResponse("/demo-mall/change-password", status_code=302)
 
 
 @mcp.custom_route("/health", methods=["GET"])
